@@ -395,8 +395,9 @@ impl Composer {
     }
 
     fn decorate(as_name: &str) -> String {
-        let as_name = data_encoding::BASE32_NOPAD.encode(as_name.as_bytes());
-        format!("{DECORATION_PRE}{as_name}{DECORATION_POST}")
+        // let as_name = data_encoding::BASE32_NOPAD.encode(as_name.as_bytes());
+        // format!("{DECORATION_PRE}{as_name}{DECORATION_POST}")
+        format!("{as_name}_")
     }
 
     fn decode(from: &str) -> String {
