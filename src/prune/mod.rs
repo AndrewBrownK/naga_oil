@@ -93,6 +93,9 @@ impl FunctionReq {
         expr_map: &HashMap<Handle<Expression>, Handle<Expression>>,
     ) -> Expression {
         match expr {
+            Expression::Literal(_) => expr.clone(),
+            Expression::ZeroValue(_) => expr.clone(),
+            Expression::WorkGroupUniformLoadResult { ty: _ty } => expr.clone(),
             Expression::Access { base, index } => Expression::Access {
                 base: expr_map[base],
                 index: expr_map[index],
@@ -245,6 +248,9 @@ impl FunctionReq {
                     committed: *committed,
                 }
             }
+            Expression::Override(_) => expr.clone(),
+            Expression::SubgroupBallotResult => expr.clone(),
+            Expression::SubgroupOperationResult { .. } => expr.clone(),
         }
     }
 
@@ -793,25 +799,38 @@ impl PartReq {
     ) -> (PartReq, Option<Vec<Handle<Type>>>) {
         let ty = types.get_handle(ty).unwrap();
         match &ty.inner {
-            naga::TypeInner::Vector { size, .. } => (PartReq::Part((0..*size as usize).map(|i| (i, PartReq::All)).collect()), None),
-            naga::TypeInner::Matrix { columns, rows, .. } => {(
-                PartReq::Part((0..*columns as usize).map(|c| (c, PartReq::Part((0..*rows as usize).map(|r| (r, PartReq::All)).collect()))).collect()),
-                None
-            )},
-            naga::TypeInner::Struct { members, .. } => {(
+            naga::TypeInner::Vector { size, .. } => (
+                PartReq::Part((0..*size as usize).map(|i| (i, PartReq::All)).collect()),
+                None,
+            ),
+            naga::TypeInner::Matrix { columns, rows, .. } => (
+                PartReq::Part(
+                    (0..*columns as usize)
+                        .map(|c| {
+                            (
+                                c,
+                                PartReq::Part(
+                                    (0..*rows as usize).map(|r| (r, PartReq::All)).collect(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                ),
+                None,
+            ),
+            naga::TypeInner::Struct { members, .. } => (
                 PartReq::Part((0..members.len()).map(|i| (i, PartReq::All)).collect()),
-                Some(members.iter().map(|sm| sm.ty).collect())
-            )},
-            _ => (PartReq::All, None)
-            // todo: we can probably do better for some of these ...
-            // naga::TypeInner::Scalar { .. } => todo!(),
-            // naga::TypeInner::Atomic { kind, width } => todo!(),
-            // naga::TypeInner::Pointer { base, space } => todo!(),
-            // naga::TypeInner::ValuePointer { size, kind, width, space } => todo!(),
-            // naga::TypeInner::Array { base, size, stride } => todo!(),
-            // naga::TypeInner::Image { dim, arrayed, class } => todo!(),
-            // naga::TypeInner::Sampler { comparison } => todo!(),
-            // naga::TypeInner::BindingArray { base, size } => todo!(),
+                Some(members.iter().map(|sm| sm.ty).collect()),
+            ),
+            _ => (PartReq::All, None), // todo: we can probably do better for some of these ...
+                                       // naga::TypeInner::Scalar { .. } => todo!(),
+                                       // naga::TypeInner::Atomic { kind, width } => todo!(),
+                                       // naga::TypeInner::Pointer { base, space } => todo!(),
+                                       // naga::TypeInner::ValuePointer { size, kind, width, space } => todo!(),
+                                       // naga::TypeInner::Array { base, size, stride } => todo!(),
+                                       // naga::TypeInner::Image { dim, arrayed, class } => todo!(),
+                                       // naga::TypeInner::Sampler { comparison } => todo!(),
+                                       // naga::TypeInner::BindingArray { base, size } => todo!(),
         }
     }
 
@@ -1150,6 +1169,9 @@ impl<'a> Pruner<'a> {
         );
 
         match expr {
+            Expression::Literal(_) => (),
+            Expression::ZeroValue(_) => (),
+            Expression::WorkGroupUniformLoadResult { .. } => (),
             Expression::AccessIndex { base, index } => self.add_expression(
                 function,
                 func_req,
@@ -1236,10 +1258,6 @@ impl<'a> Pruner<'a> {
                         context.locals.insert(*lv, part.clone());
                     }
                 }
-                let lv = function.local_variables.try_get(*lv).unwrap();
-                if let Some(init) = lv.init {
-                    self.constants.insert(init);
-                }
             }
             Expression::Load { pointer } => {
                 self.add_expression(function, func_req, context, *pointer, part);
@@ -1250,7 +1268,7 @@ impl<'a> Pruner<'a> {
                 gather: _gather,
                 coordinate,
                 array_index,
-                offset,
+                offset: _offset,
                 level,
                 depth_ref,
             } => {
@@ -1259,7 +1277,6 @@ impl<'a> Pruner<'a> {
                 self.add_expression(function, func_req, context, *coordinate, &PartReq::All);
                 array_index
                     .map(|e| self.add_expression(function, func_req, context, e, &PartReq::All));
-                offset.map(|c| self.constants.insert(c));
                 match level {
                     naga::SampleLevel::Auto | naga::SampleLevel::Zero => (),
                     naga::SampleLevel::Exact(e) | naga::SampleLevel::Bias(e) => {
@@ -1357,6 +1374,15 @@ impl<'a> Pruner<'a> {
                 committed: _committed,
             } => {
                 self.add_expression(function, func_req, context, *query, &PartReq::All);
+            }
+            Expression::Override(_) => {
+                // we don't prune overrides, so nothing to do
+            }
+            Expression::SubgroupBallotResult => {
+                // nothing, handled by the statement
+            }
+            Expression::SubgroupOperationResult { .. } => {
+                // nothing, handled by the statement
             }
         }
 
@@ -1654,6 +1680,56 @@ impl<'a> Pruner<'a> {
                 let required = self.store_required(context, &var_ref);
                 RayQuery(required.is_some())
             }
+            Statement::WorkGroupUniformLoad { pointer, result } => {
+                let var_ref = Self::resolve_var(function, *result, Vec::default());
+                let required = self.store_required(context, &var_ref).is_some();
+                if required {
+                    self.add_expression(function, func_req, context, *pointer, &PartReq::All);
+                }
+                RayQuery(required)
+            }
+            Statement::SubgroupBallot { result, predicate } => {
+                let var_ref = Self::resolve_var(function, *result, Vec::default());
+                let required = self.store_required(context, &var_ref).is_some();
+                if required {
+                    if let Some(predicate) = predicate {
+                        self.add_expression(function, func_req, context, *predicate, &PartReq::All);
+                    }
+                }
+                RayQuery(required)
+            }
+            Statement::SubgroupGather {
+                mode,
+                argument,
+                result,
+            } => {
+                let var_ref = Self::resolve_var(function, *result, Vec::default());
+                let required = self.store_required(context, &var_ref).is_some();
+                if required {
+                    match mode {
+                        naga::GatherMode::BroadcastFirst => (),
+                        naga::GatherMode::Broadcast(h_src)
+                        | naga::GatherMode::Shuffle(h_src)
+                        | naga::GatherMode::ShuffleDown(h_src)
+                        | naga::GatherMode::ShuffleUp(h_src)
+                        | naga::GatherMode::ShuffleXor(h_src) => {
+                            self.add_expression(function, func_req, context, *h_src, &PartReq::All)
+                        }
+                    }
+                    self.add_expression(function, func_req, context, *argument, &PartReq::All);
+                }
+                RayQuery(required)
+            }
+            Statement::SubgroupCollectiveOperation {
+                argument, result, ..
+            } => {
+                let var_ref = Self::resolve_var(function, *result, Vec::default());
+                let required = self.store_required(context, &var_ref).is_some();
+                if required {
+                    self.add_expression(function, func_req, context, *argument, &PartReq::All);
+                }
+                RayQuery(required)
+            }
         }
     }
 
@@ -1779,6 +1855,11 @@ impl<'a> Pruner<'a> {
     pub fn rewrite(&self) -> Module {
         let mut derived = DerivedModule::default();
         derived.set_shader_source(self.module, 0);
+
+        // just copy all the (pipeline + normal) constants for now, so we can copy const handles as well
+        for (h_cexpr, _) in self.module.global_expressions.iter() {
+            derived.import_global_expression(h_cexpr);
+        }
 
         for (h_f, f) in self.module.functions.iter() {
             if let Some(req) = self.functions.get(&h_f) {

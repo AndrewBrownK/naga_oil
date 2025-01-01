@@ -1,19 +1,24 @@
-use std::ops::Range;
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 use codespan_reporting::{
     diagnostic::{Diagnostic, Label},
     files::SimpleFile,
     term,
+    term::termcolor::WriteColor,
 };
 use thiserror::Error;
 use tracing::trace;
 
-use super::Composer;
+use super::{preprocess::PreprocessOutput, Composer, ShaderDefValue};
 use crate::{compose::SPAN_SHIFT, redirect::RedirectError};
 
 #[derive(Debug)]
 pub enum ErrSource {
-    Module(String, usize),
+    Module {
+        name: String,
+        offset: usize,
+        defs: HashMap<String, ShaderDefValue>,
+    },
     Constructing {
         path: String,
         source: String,
@@ -24,21 +29,32 @@ pub enum ErrSource {
 impl ErrSource {
     pub fn path<'a>(&'a self, composer: &'a Composer) -> &'a String {
         match self {
-            ErrSource::Module(c, _) => &composer.module_sets.get(c).unwrap().file_path,
+            ErrSource::Module { name, .. } => &composer.module_sets.get(name).unwrap().file_path,
             ErrSource::Constructing { path, .. } => path,
         }
     }
 
-    pub fn source<'a>(&'a self, composer: &'a Composer) -> &'a String {
+    pub fn source<'a>(&'a self, composer: &'a Composer) -> Cow<'a, String> {
         match self {
-            ErrSource::Module(c, _) => &composer.module_sets.get(c).unwrap().substituted_source,
-            ErrSource::Constructing { source, .. } => source,
+            ErrSource::Module { name, defs, .. } => {
+                let raw_source = &composer.module_sets.get(name).unwrap().sanitized_source;
+                let Ok(PreprocessOutput {
+                    preprocessed_source: source,
+                    ..
+                }) = composer.preprocessor.preprocess(raw_source, defs)
+                else {
+                    return Default::default();
+                };
+
+                Cow::Owned(source)
+            }
+            ErrSource::Constructing { source, .. } => Cow::Borrowed(source),
         }
     }
 
     pub fn offset(&self) -> usize {
         match self {
-            ErrSource::Module(_, offset) | ErrSource::Constructing { offset, .. } => *offset,
+            ErrSource::Module { offset, .. } | ErrSource::Constructing { offset, .. } => *offset,
         }
     }
 }
@@ -53,14 +69,18 @@ pub struct ComposerError {
 
 #[derive(Debug, Error)]
 pub enum ComposerErrorInner {
+    #[error("{0}")]
+    ImportParseError(String, usize),
     #[error("required import '{0}' not found")]
     ImportNotFound(String, usize),
     #[error("{0}")]
     WgslParseError(naga::front::wgsl::ParseError),
+    #[cfg(feature = "glsl")]
     #[error("{0:?}")]
-    GlslParseError(Vec<naga::front::glsl::Error>),
+    GlslParseError(naga::front::glsl::ParseErrors),
     #[error("naga_oil bug, please file a report: failed to convert imported module IR back into WGSL for use with WGSL shaders: {0}")]
     WgslBackError(naga::back::wgsl::Error),
+    #[cfg(feature = "glsl")]
     #[error("naga_oil bug, please file a report: failed to convert imported module IR back into GLSL for use with GLSL shaders: {0}")]
     GlslBackError(naga::back::glsl::Error),
     #[error("naga_oil bug, please file a report: composer failed to build a valid header: {0}")]
@@ -159,13 +179,8 @@ impl ComposerError {
                 ..((rng.end & ((1 << SPAN_SHIFT) - 1)).saturating_sub(source_offset))
         };
 
-        let files = SimpleFile::new(path, source);
+        let files = SimpleFile::new(path, source.as_str());
         let config = term::Config::default();
-        #[cfg(test)]
-        let mut writer = term::termcolor::NoColor::new(Vec::new());
-        #[cfg(not(test))]
-        let mut writer = term::termcolor::Ansi::new(Vec::new());
-
         let (labels, notes) = match &self.inner {
             ComposerErrorInner::DecorationInSource(range) => {
                 (vec![Label::primary((), range.clone())], vec![])
@@ -176,7 +191,7 @@ impl ComposerError {
                     .map(|(span, desc)| {
                         trace!(
                             "mapping span {:?} -> {:?}",
-                            span.to_range().unwrap(),
+                            span.to_range().unwrap_or(0..0),
                             map_span(span.to_range().unwrap_or(0..0))
                         );
                         Label::primary((), map_span(span.to_range().unwrap_or(0..0)))
@@ -191,16 +206,23 @@ impl ComposerError {
                 vec![Label::primary((), *pos..*pos)],
                 vec![format!("missing import '{msg}'")],
             ),
+            ComposerErrorInner::ImportParseError(msg, pos) => (
+                vec![Label::primary((), *pos..*pos)],
+                vec![format!("invalid import spec: '{msg}'")],
+            ),
             ComposerErrorInner::WgslParseError(e) => (
                 e.labels()
                     .map(|(range, msg)| {
-                        Label::primary((), map_span(range.to_range().unwrap())).with_message(msg)
+                        Label::primary((), map_span(range.to_range().unwrap_or(0..0)))
+                            .with_message(msg)
                     })
                     .collect(),
                 vec![e.message().to_owned()],
             ),
+            #[cfg(feature = "glsl")]
             ComposerErrorInner::GlslParseError(e) => (
-                e.iter()
+                e.errors
+                    .iter()
                     .map(|naga::front::glsl::Error { kind, meta }| {
                         Label::primary((), map_span(meta.to_range().unwrap_or(0..0)))
                             .with_message(kind.to_string())
@@ -223,6 +245,7 @@ impl ComposerError {
             ComposerErrorInner::WgslBackError(e) => {
                 return format!("{path}: wgsl back error: {e}");
             }
+            #[cfg(feature = "glsl")]
             ComposerErrorInner::GlslBackError(e) => {
                 return format!("{path}: glsl back error: {e}");
             }
@@ -250,11 +273,35 @@ impl ComposerError {
             .with_labels(labels)
             .with_notes(notes);
 
-        term::emit(&mut writer, &config, &files, &diagnostic).expect("cannot write error");
+        let mut msg = Vec::with_capacity(256);
 
-        let msg = writer.into_inner();
-        let msg = String::from_utf8_lossy(&msg);
+        let mut color_writer;
+        let mut no_color_writer;
+        let writer: &mut dyn WriteColor = if supports_color() {
+            color_writer = term::termcolor::Ansi::new(&mut msg);
+            &mut color_writer
+        } else {
+            no_color_writer = term::termcolor::NoColor::new(&mut msg);
+            &mut no_color_writer
+        };
 
-        msg.to_string()
+        term::emit(writer, &config, &files, &diagnostic).expect("cannot write error");
+
+        String::from_utf8_lossy(&msg).into_owned()
+    }
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn supports_color() -> bool {
+    false
+}
+
+// termcolor doesn't expose this logic when using custom buffers
+#[cfg(not(any(test, target_arch = "wasm32")))]
+fn supports_color() -> bool {
+    match std::env::var_os("TERM") {
+        None if cfg!(unix) => false,
+        Some(term) if term == "dumb" => false,
+        _ => std::env::var_os("NO_COLOR").is_none(),
     }
 }

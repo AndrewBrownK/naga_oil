@@ -62,12 +62,16 @@ impl Redirector {
                 | Statement::Break
                 | Statement::Continue
                 | Statement::Return { .. }
+                | Statement::WorkGroupUniformLoad { .. }
                 | Statement::Kill
                 | Statement::Barrier(_)
                 | Statement::Store { .. }
                 | Statement::ImageStore { .. }
                 | Statement::Atomic { .. }
-                | Statement::RayQuery { .. } => (),
+                | Statement::RayQuery { .. }
+                | Statement::SubgroupBallot { .. }
+                | Statement::SubgroupGather { .. }
+                | Statement::SubgroupCollectiveOperation { .. } => (),
             }
         }
     }
